@@ -1,0 +1,16 @@
+host: smtp.example.com
+port: 587
+auth: starttls
+username: user@example.com
+password: your-password
+ehlo_host: localhost
+from_name: TEST
+from_address: sender@example.com
+to:
+  - recipient@example.com
+subject: mail_sender sample
+body: |
+  aaaa
+  bbbb
+  ccdd
+  dddd
