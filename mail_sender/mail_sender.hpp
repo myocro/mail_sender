@@ -24,6 +24,7 @@ public:
     } auth = Smtp::STARTTLS;
 
     int port = 587;
+    int timeout_milliseconds = 15000;
     std::string host;
     std::string username;
     std::string password;
@@ -39,6 +40,7 @@ public:
   } mail;
 
   bool send();
+  const std::string& lastError() const;
   void setDebugMsgFunc(std::function<void(const std::string&)> debugMsgFunc);
 
 private:

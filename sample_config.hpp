@@ -23,6 +23,7 @@ struct SampleConfig {
 
     smtp.host = root["host"].as<std::string>();
     smtp.port = root["port"].as<int>();
+    smtp.timeout_milliseconds = root["timeout_milliseconds"].as<int>();
     smtp.username = root["username"].as<std::string>();
     smtp.password = root["password"].as<std::string>();
     smtp.ehlo_host = root["ehlo_host"].as<std::string>();

@@ -34,6 +34,7 @@ sudo apt install libssl-dev libyaml-cpp-dev
 ```yaml
 host: smtp.example.com
 port: 587
+timeout_milliseconds: 15000
 auth: starttls
 username: user@example.com
 password: your-password

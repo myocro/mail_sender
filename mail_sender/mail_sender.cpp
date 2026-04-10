@@ -5,7 +5,9 @@
 #include <openssl/ssl.h>
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -195,6 +197,42 @@ bool is_expected_code(int code, const std::vector<int>& expected_codes) {
   return std::find(expected_codes.begin(), expected_codes.end(), code) != expected_codes.end();
 }
 
+std::string join_lines(const std::vector<std::string>& lines, const std::string& delimiter) {
+  std::ostringstream stream;
+  for (std::size_t i = 0; i < lines.size(); ++i) {
+    if (i != 0) {
+      stream << delimiter;
+    }
+    stream << lines[i];
+  }
+  return stream.str();
+}
+
+std::string to_upper(std::string text) {
+  std::transform(text.begin(), text.end(), text.begin(), [](unsigned char ch) {
+    return static_cast<char>(std::toupper(ch));
+  });
+  return text;
+}
+
+bool ehlo_supports(const std::vector<std::string>& lines, const std::string& capability) {
+  const std::string needle = to_upper(capability);
+  for (const std::string& line : lines) {
+    if (line.size() < 4) {
+      continue;
+    }
+    const std::string upper = to_upper(line.substr(4));
+    if (upper == needle || upper.rfind(needle + " ", 0) == 0) {
+      return true;
+    }
+    if (needle == "AUTH LOGIN" && upper.rfind("AUTH ", 0) == 0 &&
+        upper.find("LOGIN") != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
 class SslInitializer {
  public:
   SslInitializer() {
@@ -213,11 +251,12 @@ class SockIO {
  public:
   ~SockIO() { close(); }
 
-  bool connect(const std::string& host, int port) {
+  bool connect(const std::string& host, int port, int timeout_milliseconds) {
     close();
     debug_stream.str("");
     debug_stream.clear();
     host_ = host;
+    timeout_milliseconds_ = std::max(timeout_milliseconds, 1);
 
     struct addrinfo hints {};
     hints.ai_family = AF_UNSPEC;
@@ -239,10 +278,51 @@ class SockIO {
       if (socket_fd_ < 0) {
         continue;
       }
-      if (::connect(socket_fd_, candidate->ai_addr, candidate->ai_addrlen) == 0) {
+
+      const int flags = fcntl(socket_fd_, F_GETFL, 0);
+      if (flags < 0 || fcntl(socket_fd_, F_SETFL, flags | O_NONBLOCK) < 0) {
+        const int saved_errno = errno;
+        ::close(socket_fd_);
+        socket_fd_ = -1;
+        debug_stream << "fcntl failed: " << std::strerror(saved_errno) << '\n';
+        continue;
+      }
+
+      const int connect_result = ::connect(socket_fd_, candidate->ai_addr, candidate->ai_addrlen);
+      if (connect_result == 0) {
+        fcntl(socket_fd_, F_SETFL, flags);
         connected = true;
         break;
       }
+
+      if (errno == EINPROGRESS) {
+        struct pollfd poll_fd {};
+        poll_fd.fd = socket_fd_;
+        poll_fd.events = POLLOUT;
+        const int poll_result = poll(&poll_fd, 1, timeout_milliseconds_);
+        if (poll_result > 0 && (poll_fd.revents & POLLOUT) != 0) {
+          int socket_error = 0;
+          socklen_t length = sizeof(socket_error);
+          if (getsockopt(socket_fd_, SOL_SOCKET, SO_ERROR, &socket_error, &length) == 0 &&
+              socket_error == 0) {
+            fcntl(socket_fd_, F_SETFL, flags);
+            connected = true;
+            break;
+          }
+          const int saved_errno = socket_error == 0 ? errno : socket_error;
+          ::close(socket_fd_);
+          socket_fd_ = -1;
+          debug_stream << "connect failed: " << std::strerror(saved_errno) << '\n';
+          continue;
+        }
+        if (poll_result == 0) {
+          ::close(socket_fd_);
+          socket_fd_ = -1;
+          debug_stream << "connect timeout after " << timeout_milliseconds_ << " ms\n";
+          continue;
+        }
+      }
+
       const int saved_errno = errno;
       ::close(socket_fd_);
       socket_fd_ = -1;
@@ -255,6 +335,12 @@ class SockIO {
       debug_stream << "all connection attempts failed";
       return false;
     }
+
+    struct timeval timeout {};
+    timeout.tv_sec = timeout_milliseconds_ / 1000;
+    timeout.tv_usec = static_cast<suseconds_t>((timeout_milliseconds_ % 1000) * 1000);
+    setsockopt(socket_fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(socket_fd_, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
     return true;
   }
 
@@ -395,6 +481,7 @@ class SockIO {
   }
 
   std::string host_;
+  int timeout_milliseconds_ = 15000;
   int socket_fd_ = -1;
   std::unique_ptr<SSL_CTX, SslContextDeleter> ssl_context_;
   std::unique_ptr<SSL, SslDeleter> ssl_;
@@ -425,29 +512,39 @@ class MailSender::Impl {
     }
   }
 
+  void set_error(std::string message) {
+    last_error = std::move(message);
+    print("ERROR: " + last_error);
+  }
+
   bool send_command(const Command& command) {
     const std::string wire =
         command.append_crlf ? command.payload + "\r\n" : command.payload;
     if (!socket.write_all(wire)) {
-      print("ERROR: " + socket.debug_text());
+      set_error(socket.debug_text());
       return false;
     }
 
     print(command.hide_in_log ? "C: -----------" : "C: " + command.payload);
 
-    std::vector<std::string> response_lines;
-    if (!socket.read_response(response_lines)) {
-      print("ERROR: " + socket.debug_text());
+    last_response_lines.clear();
+    if (!socket.read_response(last_response_lines)) {
+      set_error(socket.debug_text());
       return false;
     }
-    print_lines(response_lines);
+    print_lines(last_response_lines);
 
     int response_code = 0;
     bool finished = false;
-    if (response_lines.empty() ||
-        !parse_response_code(response_lines.back(), response_code, finished) ||
+    if (last_response_lines.empty() ||
+        !parse_response_code(last_response_lines.back(), response_code, finished) ||
         !is_expected_code(response_code, command.expected_codes)) {
-      print("ERROR: unexpected SMTP response");
+      std::ostringstream stream;
+      stream << "unexpected SMTP response";
+      if (!last_response_lines.empty()) {
+        stream << ": " << join_lines(last_response_lines, " | ");
+      }
+      set_error(stream.str());
       return false;
     }
     last_response_code = response_code;
@@ -457,11 +554,17 @@ class MailSender::Impl {
   SockIO socket;
   std::function<void(const std::string&)> debug_callback;
   int last_response_code = 0;
+  std::vector<std::string> last_response_lines;
+  std::string last_error;
 };
 
 MailSender::MailSender() : pimpl(std::make_unique<Impl>()) {}
 
 MailSender::~MailSender() = default;
+
+const std::string& MailSender::lastError() const {
+  return pimpl->last_error;
+}
 
 void MailSender::setDebugMsgFunc(
     std::function<void(const std::string&)> debugMsgFunc) {
@@ -469,21 +572,26 @@ void MailSender::setDebugMsgFunc(
 }
 
 bool MailSender::send() {
+  pimpl->last_error.clear();
   if (smtp.host.empty() || smtp.username.empty() || smtp.password.empty() ||
       mail.from_address.empty() || mail.rcpt.empty() || mail.bodyHtml.empty()) {
-    pimpl->print("ERROR: required SMTP or mail fields are empty");
+    pimpl->set_error("required SMTP or mail fields are empty");
+    return false;
+  }
+  if (smtp.timeout_milliseconds <= 0) {
+    pimpl->set_error("smtp.timeout_milliseconds must be greater than zero");
     return false;
   }
 
   pimpl->print("Connect to " + smtp.host + ":" + std::to_string(smtp.port));
-  if (!pimpl->socket.connect(smtp.host, smtp.port)) {
-    pimpl->print("ERROR: " + pimpl->socket.debug_text());
+  if (!pimpl->socket.connect(smtp.host, smtp.port, smtp.timeout_milliseconds)) {
+    pimpl->set_error(pimpl->socket.debug_text());
     return false;
   }
 
   std::vector<std::string> banner_lines;
   if (!pimpl->socket.read_response(banner_lines)) {
-    pimpl->print("ERROR: " + pimpl->socket.debug_text());
+    pimpl->set_error(pimpl->socket.debug_text());
     return false;
   }
   pimpl->print_lines(banner_lines);
@@ -492,34 +600,46 @@ bool MailSender::send() {
   bool finished = false;
   if (!parse_response_code(banner_lines.back(), banner_code, finished) ||
       banner_code != 220) {
-    pimpl->print("ERROR: invalid SMTP banner");
+    pimpl->set_error("invalid SMTP banner: " + join_lines(banner_lines, " | "));
     return false;
   }
 
   if (smtp.auth == Smtp::SSL_TLS) {
     if (!pimpl->socket.start_ssl()) {
-      pimpl->print("ERROR: " + pimpl->socket.debug_text());
+      pimpl->set_error(pimpl->socket.debug_text());
       return false;
     }
     pimpl->print("--- SSL/TLS connected ---");
   } else if (smtp.auth == Smtp::STARTTLS) {
-    if (!pimpl->send_command(
-            {"EHLO " + smtp.ehlo_host, false, true, {250}}) ||
-        !pimpl->send_command({"STARTTLS", false, true, {220}})) {
+    if (!pimpl->send_command({"EHLO " + smtp.ehlo_host, false, true, {250}})) {
+      return false;
+    }
+    if (!ehlo_supports(pimpl->last_response_lines, "STARTTLS")) {
+      pimpl->set_error("server does not advertise STARTTLS");
+      return false;
+    }
+    if (!pimpl->send_command({"STARTTLS", false, true, {220}})) {
       return false;
     }
     if (!pimpl->socket.start_ssl()) {
-      pimpl->print("ERROR: " + pimpl->socket.debug_text());
+      pimpl->set_error(pimpl->socket.debug_text());
       return false;
     }
     pimpl->print("--- STARTTLS connected ---");
   } else {
-    pimpl->print("ERROR: unsupported SMTP authentication mode");
+    pimpl->set_error("unsupported SMTP authentication mode");
+    return false;
+  }
+
+  if (!pimpl->send_command({"EHLO " + smtp.ehlo_host, false, true, {250}})) {
+    return false;
+  }
+  if (!ehlo_supports(pimpl->last_response_lines, "AUTH LOGIN")) {
+    pimpl->set_error("server does not advertise AUTH LOGIN");
     return false;
   }
 
   std::vector<Impl::Command> commands = {
-      {"EHLO " + smtp.ehlo_host, false, true, {250}},
       {"AUTH LOGIN", false, true, {334}},
       {base64_encode(smtp.username), true, true, {334}},
       {base64_encode(smtp.password), true, true, {235}},
