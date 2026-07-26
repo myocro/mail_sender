@@ -653,7 +653,10 @@ bool MailSender::send() {
   std::string message;
   message += "Date: " + rfc2822_date() + "\r\n";
   message += "From: " + format_address(mail.from_address, mail.from_name) + "\r\n";
-  message += "To: " + join_recipients(mail.rcpt) + "\r\n";
+  // BCC 相当: 受信者を To に列挙すると受信者同士で互いのアドレスが見えてしまう。
+  // To は送信元自身にし、実際の配送は上の RCPT TO (SMTP エンベロープ) のみで行う
+  // (全員に届くが互いのアドレスは不可視)。join_recipients は将来の Cc 用に残す。
+  message += "To: " + format_address(mail.from_address, mail.from_name) + "\r\n";
   message += "Subject: " + encode_utf8_base64(mail.subject) + "\r\n";
   message += "MIME-Version: 1.0\r\n";
   message += "Content-Type: text/html; charset=UTF-8\r\n";
