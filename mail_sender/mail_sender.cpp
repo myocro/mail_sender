@@ -660,6 +660,9 @@ bool MailSender::send() {
   message += "Subject: " + encode_utf8_base64(mail.subject) + "\r\n";
   message += "MIME-Version: 1.0\r\n";
   message += "Content-Type: text/html; charset=UTF-8\r\n";
+  if (!mail.language.empty()) {
+    message += "Content-Language: " + mail.language + "\r\n";
+  }
   message += "Content-Transfer-Encoding: base64\r\n";
   message += "\r\n";
   message += fold_base64(base64_encode(to_crlf(mail.bodyHtml)));
