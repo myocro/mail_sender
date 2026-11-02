@@ -184,13 +184,14 @@ std::string join_recipients(const std::vector<std::string>& recipients) {
 
 // HTML の本文から、テキスト版 (multipart/alternative の text/plain) を作る。
 // 迷惑メールの判定で「HTML だけのメール」が不利になるため (Hotmail で迷惑メールにされた事例、2026-11-02)。
-// 凝った変換はしない: 段落・改行で行を分け、<a href="URL">文字</a> は「文字: URL」、タグは捨て、よく使う実体参照だけ戻す
+// 凝った変換はしない: 段落・改行で行を分け、<a href="URL">文字</a> は「文字: URL」、head / style / script / title の中身と
+// タグは捨て、よく使う実体参照だけ戻す
 std::string html_to_text(const std::string& html) {
   auto lower = [](std::string t) { for (auto& c : t) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); return t; };
-  std::string out, href;
+  std::string out, href, skip;   // skip = 中身を捨てる要素名 (head / style / script / title。閉じタグまで)
   std::size_t link_start = std::string::npos;
   for (std::size_t i = 0; i < html.size();) {
-    if (html[i] != '<') { out += html[i++]; continue; }
+    if (html[i] != '<') { if (skip.empty()) out += html[i]; ++i; continue; }
     const std::size_t end = html.find('>', i);
     if (end == std::string::npos) break;
     const std::string tag = lower(html.substr(i + 1, end - i - 1));
@@ -198,7 +199,11 @@ std::string html_to_text(const std::string& html) {
     const bool closing = !tag.empty() && tag[0] == '/';
     const std::string body = closing ? tag.substr(1) : tag;
     const std::string name = body.substr(0, body.find_first_of(" \t\r\n/"));
+    if (!skip.empty()) { if (closing && name == skip) skip.clear(); continue; }
+    if (!closing && (name == "head" || name == "style" || name == "script" || name == "title")) { skip = name; continue; }
     if (name == "br") { out += "\n"; continue; }
+    if (name == "hr") { out += "\n"; continue; }                                   // 区切り線 = 空行
+    if (closing && (name == "td" || name == "th")) { out += "\t"; continue; }       // 表のセルはタブで区切る
     if (closing && (name == "p" || name == "div" || name == "tr" || name == "li" || name == "h1" || name == "h2" || name == "h3" || name == "table")) {
       out += "\n"; continue;
     }
