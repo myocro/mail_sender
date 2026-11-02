@@ -182,6 +182,56 @@ std::string join_recipients(const std::vector<std::string>& recipients) {
   return stream.str();
 }
 
+// HTML の本文から、テキスト版 (multipart/alternative の text/plain) を作る。
+// 迷惑メールの判定で「HTML だけのメール」が不利になるため (Hotmail で迷惑メールにされた事例、2026-11-02)。
+// 凝った変換はしない: 段落・改行で行を分け、<a href="URL">文字</a> は「文字: URL」、タグは捨て、よく使う実体参照だけ戻す
+std::string html_to_text(const std::string& html) {
+  auto lower = [](std::string t) { for (auto& c : t) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); return t; };
+  std::string out, href;
+  std::size_t link_start = std::string::npos;
+  for (std::size_t i = 0; i < html.size();) {
+    if (html[i] != '<') { out += html[i++]; continue; }
+    const std::size_t end = html.find('>', i);
+    if (end == std::string::npos) break;
+    const std::string tag = lower(html.substr(i + 1, end - i - 1));
+    i = end + 1;
+    const bool closing = !tag.empty() && tag[0] == '/';
+    const std::string body = closing ? tag.substr(1) : tag;
+    const std::string name = body.substr(0, body.find_first_of(" \t\r\n/"));
+    if (name == "br") { out += "\n"; continue; }
+    if (closing && (name == "p" || name == "div" || name == "tr" || name == "li" || name == "h1" || name == "h2" || name == "h3" || name == "table")) {
+      out += "\n"; continue;
+    }
+    if (!closing && name == "a") {
+      const std::size_t h = tag.find("href=");
+      href.clear();
+      if (h != std::string::npos) {
+        const std::string orig = html.substr(end - (tag.size() - h), tag.size() - h);   // 大文字小文字を保った href
+        const char q = orig.size() > 5 ? orig[5] : ' ';
+        if (q == '"' || q == '\'') { const std::size_t e = orig.find(q, 6); href = orig.substr(6, e == std::string::npos ? std::string::npos : e - 6); }
+      }
+      link_start = out.size();
+      continue;
+    }
+    if (closing && name == "a") {
+      if (!href.empty() && link_start != std::string::npos && out.substr(link_start) != href) out += ": " + href;
+      href.clear(); link_start = std::string::npos;
+      continue;
+    }
+  }
+  const std::pair<const char*, const char*> ents[] = {{"&lt;", "<"}, {"&gt;", ">"}, {"&quot;", "\""}, {"&#39;", "'"}, {"&nbsp;", " "}, {"&amp;", "&"}};
+  for (const auto& e : ents)
+    for (std::size_t p = out.find(e.first); p != std::string::npos; p = out.find(e.first, p + std::strlen(e.second)))
+      out.replace(p, std::strlen(e.first), e.second);
+  // 空行は 1 つまで
+  std::string res;
+  int nl = 0;
+  for (char c : out) {
+    if (c == '\n') { if (++nl <= 2) res += c; } else { nl = 0; res += c; }
+  }
+  return res;
+}
+
 std::string rfc2822_date() {
   const auto now = std::chrono::system_clock::now();
   const std::time_t timestamp = std::chrono::system_clock::to_time_t(now);
@@ -653,19 +703,31 @@ bool MailSender::send() {
   std::string message;
   message += "Date: " + rfc2822_date() + "\r\n";
   message += "From: " + format_address(mail.from_address, mail.from_name) + "\r\n";
-  // BCC 相当: 受信者を To に列挙すると受信者同士で互いのアドレスが見えてしまう。
-  // To は送信元自身にし、実際の配送は上の RCPT TO (SMTP エンベロープ) のみで行う
-  // (全員に届くが互いのアドレスは不可視)。join_recipients は将来の Cc 用に残す。
-  message += "To: " + format_address(mail.from_address, mail.from_name) + "\r\n";
+  // 宛先が 1 人なら To にその人を入れる (招待・登録完了・パスワード再設定など)。To が受信者でないメールは
+  // 迷惑メールの判定で不利になる (Hotmail で迷惑メールにされた事例、2026-11-02)。
+  // 複数人は BCC 相当: 受信者を To に列挙すると受信者同士で互いのアドレスが見えてしまうので、To は送信元自身にし、
+  // 実際の配送は上の RCPT TO (SMTP エンベロープ) のみで行う。join_recipients は将来の Cc 用に残す。
+  const bool single = mail.rcpt.size() == 1 && mail.rcpt[0].find_first_of("\r\n<>") == std::string::npos;
+  message += "To: " + (single ? "<" + mail.rcpt[0] + ">" : format_address(mail.from_address, mail.from_name)) + "\r\n";
   message += "Subject: " + encode_utf8_base64(mail.subject) + "\r\n";
   message += "MIME-Version: 1.0\r\n";
-  message += "Content-Type: text/html; charset=UTF-8\r\n";
   if (!mail.language.empty()) {
     message += "Content-Language: " + mail.language + "\r\n";
   }
-  message += "Content-Transfer-Encoding: base64\r\n";
+  // テキスト版と HTML 版の multipart/alternative (HTML だけのメールは迷惑メールの判定で不利、2026-11-02)。
+  // 区切りは本文に出てこない文字列 (base64 の本文には '=' と英数字・+/ しか出ないので "=_" を含めれば衝突しない)
+  const std::string boundary = "=_kanshikun_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+  message += "Content-Type: multipart/alternative; boundary=\"" + boundary + "\"\r\n";
   message += "\r\n";
+  message += "--" + boundary + "\r\n";
+  message += "Content-Type: text/plain; charset=UTF-8\r\n";
+  message += "Content-Transfer-Encoding: base64\r\n\r\n";
+  message += fold_base64(base64_encode(to_crlf(html_to_text(mail.bodyHtml))));
+  message += "--" + boundary + "\r\n";
+  message += "Content-Type: text/html; charset=UTF-8\r\n";
+  message += "Content-Transfer-Encoding: base64\r\n\r\n";
   message += fold_base64(base64_encode(to_crlf(mail.bodyHtml)));
+  message += "--" + boundary + "--\r\n";
 
   for (const auto& command : commands) {
     if (!pimpl->send_command(command)) {
